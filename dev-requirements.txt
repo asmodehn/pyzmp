@@ -3,7 +3,7 @@
 
 #We need this to get tox to work properly.
 tox>=2.3.1
-twine==1.8.1
+twine==1.9.1
 
 #Used by setup.py rosdevelop
 gitpython>=2.1.0

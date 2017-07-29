@@ -343,10 +343,11 @@ class Node(object):
     # Careful : this is NOT the same usage as "run()" from Process :
     # it is called inside a loop that it does not directly control...
     # TOOD : think about it and improve (Entity System integration ? Pool + Futures integration ?)
-    def update(self, *args, **kwargs):
+    def update(self, shutting_down, *args, **kwargs):
         """
         Runs at every update cycle in the node process/thread.
         Usually you want to override this method to extend the behavior of the node in your implementation
+        :param shutting_down will be True when it will be the last update call. This allows update function to do some cleanup.
         :return: integer as exitcode to stop the node, or None to keep looping...
         """
         # TODO : Check which way is better (can also be used to run external process, other functions, like Process)
@@ -489,6 +490,8 @@ class Node(object):
                 if self._target:
                     # bwcompat
                     kwargs['timedelta'] = timedelta
+                    # adding cleanup on shutdown capabilities
+                    kwargs['shutting_down'] = False
 
                     # TODO : use return code to determine when/how we need to run this the next time...
                     # Also we need to keep the exit status to be able to call external process as an update...
@@ -506,7 +509,18 @@ class Node(object):
                 # in the not so special case where we started, we didnt get exit code and we exited,
                 # this is expected as a normal result and we set an exitcode here of 0
                 # As 0 is the conventional success for unix process successful run
-                exitstatus = 0
+
+                # adding cleanup on shutdown capabilities
+                kwargs['shutting_down'] = True
+
+                logging.debug(
+                    "[{self.name}] FINAL call {self._target.__name__} with args {args} and kwargs {kwargs}.".format(
+                        **locals()))
+                exitstatus = self._target(*args, **kwargs)
+                # Note this exit status will be ignored by python process anyway.
+                # But the user might want to have different behavior on it depending on the target here.
+                # The target can be a python function, also can be a shell script, or something else...
+                # => Where is the best place for this usecase ?
 
         logging.debug("[{self.name}] Node stopped.".format(**locals()))
         return exitstatus  # returning last exit status from the update function

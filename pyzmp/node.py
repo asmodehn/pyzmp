@@ -13,6 +13,8 @@ import types
 import uuid
 
 import errno
+
+import re
 import zmq
 import socket
 import logging
@@ -100,181 +102,101 @@ except ImportError:
 
 from .master import manager
 from .exceptions import UnknownServiceException, UnknownRequestTypeException
+from .registry import FileBasedRegistry
 from .message import ServiceRequest, ServiceRequest_dictparse, ServiceResponse, ServiceException
-from .service import service_provider_cm
-#from .service import RequestMsg, ResponseMsg, ErrorMsg  # only to access message types
+from .service import service_provider_cm, Service
+from .process import Process
+# from .service import RequestMsg, ResponseMsg, ErrorMsg  # only to access message types
 
 current_node = multiprocessing.current_process
 
-# Lock is definitely needed ( not implemented in proxy objects, unless the object itself already has it, like Queue )
-nodes_lock = manager.Lock()
-nodes = manager.dict()
 
 
-@contextlib.contextmanager
-def dummy_cm():
-    yield None
+###
+#This implements a local registry, relying on the local tmp file system.
+###
+
+def _get_registry_filepath():
+    """
+    A deterministic way to find the path to a registry, so it can be used by any process.
+    :return: 
+    """
+    _zmp_froot = os.path.join(tempfile.gettempdir(), 'zmp')
+    return _zmp_froot
 
 
-@contextlib.contextmanager
-def node_cm(node_name, svc_address):
-    # advertise itself
-    nodes_lock.acquire()
-    nodes[node_name] = {'service_conn': svc_address}
-    nodes_lock.release()
+def _get_node_zmp_filepath(name):
+    # trying to follow the de-facto standard way to register daemon process info,
+    # while adding an extra information : the socket opened.
+    fname = os.path.join(_get_registry_filepath(), name + ".zmp")
+    return fname
 
-    yield
 
-    # concealing itself
-    nodes_lock.acquire()
-    nodes[node_name] = {}
-    nodes_lock.release()
+def register_node(name, pid, zmp_addr):
+    zmpfname = _get_node_zmp_filepath(name)
+    with open(zmpfname, "xt") as fh:
+        fh.write(zmp_addr)
+
+
+def unregister_node(name):
+    zmpfname = _get_node_zmp_filepath(name)
+    os.remove(zmpfname)
+
+
+def get_node_zmp(name):
+    fname = _get_node_zmp_filepath(name)
+    with open(fname, "rt") as fh:
+        zmp_addr = fh.read()
+    return zmp_addr
+
+
+
+
+
+
+
+# REF : http://stackoverflow.com/questions/3024925/python-create-a-with-block-on-several-context-managers
 
 
 # TODO : Nodelet ( thread, with fast intraprocess zmq comm - entity system design /vs/threadpool ?)
+
 # CAREFUL here : multiprocessing documentation specifies that a process object can be started only once...
-class Node(object):
+class Node(Process):
 
     EndPoint = namedtuple("EndPoint", "self func")
 
     # TODO : allow just passing target to be able to make a Node from a simple function, and also via decorator...
-    def __init__(self, name=None, socket_bind=None, context_manager=None, target=None, args=None, kwargs=None):
+    def __init__(self, name=None, socket_bind=None, target_context=None, target=None, args=None, kwargs=None):
         """
         Initializes a ZMP Node (Restartable Python Process communicating via ZMQ)
         :param name: Name of the node
         :param socket_bind: the string describing how to bind the ZMQ socket ( IPC, TCP, etc. )
-        :param context_manager: a context_manager to be used with run (in a with statement)
+        :param target_context: a context_manager to be used during "run()".
+                This is used to ensure the target is called with the appropriate context
+        :param target: the function to call in child process. It will be called while ti returns None. 
+                When an int is returned the loop will stop.
+                That loop can also be stopped by setting the terminate event (see Process).
+        :param args: the arguments to pass to the target
+        :param kwargs: the keywords arguments to pass to the target
         :return:
         """
-        # TODO check name unicity
-        # using process as delegate
-        self._pargs = {
-            'name': name or str(uuid.uuid4()),
-            'args': args or (),
-            'kwargs': kwargs or {},
-            'target': self.run,  # Careful : our run() is not the same as the one for Process
-        }
-        # Careful : our own target is not the same as the one for Process
-        self._target = target or self.update  # we expect the user to overload update in child class.
 
-        #: the actual process instance. lazy creation on start() call only.
-        self._process = None
+        self._target = target or self.target  # User overload can choose to call Process.target or not
+        target_wrap = self._update
 
-        #: whether or not the node name should be set as the actual process title
-        #: replacing the string duplicated from the python interpreter run
-        self.new_title = True
+        # careful we need to swap context managers to keep the order of calling as expected
+        self.user_required_context = target_context or self.target_context  # getting basic target context from Process. User overload can choose to call it or not.
+        # we only register the node context in for the process instance
+        super(Node, self).__init__(name=name, target_context=self._node_context, target_override=target_wrap, args=args, kwargs=kwargs)
 
-        self.context_manager = context_manager or dummy_cm  # TODO: extend to list if possible ( available for python >3.1 only )
-        self.exit = multiprocessing.Event()
-        self.started = multiprocessing.Event()
         self.listeners = {}
         self._providers = {}
+        # tmpdir for now. if moved to lowlevel system stuff -> /var/run would be more appropriate
         self.tmpdir = tempfile.mkdtemp(prefix='zmp-' + self.name + '-')
         # if no socket is specified the services of this node will be available only through IPC
         self._svc_address = socket_bind if socket_bind else 'ipc://' + self.tmpdir + '/services.pipe'
 
-    def __enter__(self):
-        # __enter__ is called only if we pass this instance to with statement ( after __init__ )
-        # start only if needed (so that we can hook up a context manager to a running node) :
-        if not self.is_alive():
-            self.start()
-        return self
-
-    def __exit__(self, exception_type, exception_value, traceback):
-        # make sure we cleanup when we exit
-        self.shutdown()
-
-    def has_started(self):
-        """
-        :return: True if the node has started (update() might not have been called yet). Might still be alive, or not...
-        """
-        return self.started.is_set()
-
-    ### Process API delegation ###
-    def is_alive(self):
-        if self and self._process:
-            return self._process.is_alive()
-
-    def join(self, timeout=None):
-        if not self._process:
-            # blocking on started event before blocking on join
-            self.started.wait(timeout=timeout)
-        return self._process.join(timeout=timeout)
-
-    @property
-    def name(self):
-        if self and self._process:
-            return self._process.name
-        else:
-            return self._pargs.get('name', "ZMPNode")
-
-    @name.setter
-    def name(self, name):
-        if self and self._process:
-            self._process.name = name
-            # only reset the name arg if it was accepted by the setter
-            self._pargs.set('name', self._process.name)
-        else:
-            # TODO : maybe we should be a bit more strict here ?
-            self._pargs.set('name', name)
-
-    @property
-    def daemon(self):
-        """
-        Return whether process is a daemon
-        :return:
-        """
-        if self._process:
-            return self._process.daemon
-        else:
-            return self._pargs.get('daemonic', False)
-
-    @daemon.setter
-    def daemon(self, daemonic):
-        """
-        Set whether process is a daemon
-        :param daemonic:
-        :return:
-        """
-        if self._process:
-            self._process.daemonic = daemonic
-        else:
-            self._pargs['daemonic'] = daemonic
-
-    @property
-    def authkey(self):
-        return self._process.authkey
-
-    @authkey.setter
-    def authkey(self, authkey):
-        """
-        Set authorization key of process
-        """
-        self._process.authkey = authkey
-
-    @property
-    def exitcode(self):
-        """
-        Return exit code of process or `None` if it has yet to stop
-        """
-        if self._process:
-            return self._process.exitcode
-        else:
-            return None
-
-    @property
-    def ident(self):
-        """
-        Return identifier (PID) of process or `None` if it has yet to start
-        """
-        if self._process:
-            return self._process.ident
-        else:
-            return None
-
-    def __repr__(self):
-        # TODO : improve this
-        return self._process.__repr__()
+        self.provides(self.index)
 
     def start(self, timeout=None):
         """
@@ -283,47 +205,20 @@ class Node(object):
         None waits until the update has been called at least once.
         """
 
-        # we lazily create our process delegate (with same arguments)
-        if self.daemon:
-            daemonic = True
-        else:
-            daemonic = False
-
-        pargs = self._pargs.copy()
-        pargs.pop('daemonic', None)
-
-        self._process = multiprocessing.Process(**pargs)
-
-        self._process.daemon = daemonic
-
-        if self.is_alive():
-            # if already started, we shutdown and join before restarting
-            # not timeout will bock here (default join behavior).
-            # otherwise we simply use the same timeout.
-            self.shutdown(join=True, timeout=timeout)  # TODO : only restart if no error (check exitcode)
-            self.start(timeout=timeout)  # recursive to try again if needed
-        else:
-            self._process.start()
+        started = super(Node, self).start(timeout=timeout)
 
         # timeout None means we want to wait and ensure it has started
         # deterministic behavior, like is_alive() from multiprocess.Process is always true after start()
-        if self.started.wait(timeout=timeout):  # blocks until we know true or false
+        if started:
             return self._svc_address  # returning the zmp url as a way to connect to the node
             # CAREFUL : doesnt make sense if this node only run a one-time task...
         # TODO: futures and ThreadPoolExecutor (so we dont need to manage the pool ourselves)
         else:
             return False
 
+
     # TODO : Implement a way to redirect stdout/stderr, or even forward to parent ?
     # cf http://ryanjoneil.github.io/posts/2014-02-14-capturing-stdout-in-a-python-child-process.html
-
-    def terminate(self):
-        """Forcefully terminates the underlying process (using SIGTERM)"""
-        return self._process.terminate()
-        # TODO : maybe redirect to shutdown here to avoid child process leaks ?
-
-    ### Node specific API ###
-    # TODO : find a way to separate process management and service provider API
 
     def provides(self, svc_callback, service_name=None):
         service_name = service_name or svc_callback.__name__
@@ -338,62 +233,31 @@ class Node(object):
         # we store an endpoint ( bound method or unbound function )
         self._providers.pop(service_name)
 
-    # TODO : shortcut to discover/build only services provided by this node ?
+    def index(self):
+        # TODO : return Services instance directly
+        return self._providers.keys()
 
-    # Careful : this is NOT the same usage as "run()" from Process :
-    # it is called inside a loop that it does not directly control...
-    # TOOD : think about it and improve (Entity System integration ? Pool + Futures integration ?)
-    def update(self, *args, **kwargs):
-        """
-        Runs at every update cycle in the node process/thread.
-        Usually you want to override this method to extend the behavior of the node in your implementation
-        :return: integer as exitcode to stop the node, or None to keep looping...
-        """
-        # TODO : Check which way is better (can also be used to run external process, other functions, like Process)
-        return None  # we keep looping by default (need to deal with services here...)
+    @contextlib.contextmanager
+    def _node_context(self):
+        # declaring our services first
+        with service_provider_cm(self.name, self._svc_address, self._providers) as spcm:
+            # advertise itself
+            nodes[self.name] = self._svc_address
+            # Do not yield until we are register (otherwise noone can find us, there is no point.)
+            yield
 
-    def shutdown(self, join=True, timeout=None):
-        """
-        Clean shutdown of the node.
-        :param join: optionally wait for the process to end (default : True)
-        :return: None
-        """
-        if self.is_alive():  # check if process started
-            print("Shutdown initiated")
-            self.exit.set()
-            if join:
-                self.join(timeout=timeout)
-                # TODO : timeout before forcing terminate (SIGTERM)
+            # concealing itself
+            nodes.pop(self.name)
 
-        exitcode = self._process.exitcode if self._process else None  # we return None if the process was never started
-        return exitcode
-
-    def run(self, *args, **kwargs):
-        """
-        The Node main method, running in a child process (similar to Process.run() but also accepts args)
-        A children class can override this method, but it needs to call super().run(*args, **kwargs)
-        for the node to start properly and call update() as expected.
-        :param args: arguments to pass to update()
-        :param kwargs: keyword arguments to pass to update()
-        :return: last exitcode returned by update()
-        """
-        # TODO : make use of the arguments ? since run is now the target for Process...
-
-        exitstatus = None  # keeping the semantic of multiprocessing.Process : running process has None
-
-        if setproctitle and self.new_title:
-            setproctitle.setproctitle("{0}".format(self.name))
-
-        print('[{node}] Node started as [{pid} <= {address}]'.format(node=self.name, pid=self.ident, address=self._svc_address))
-
-
+    @contextlib.contextmanager
+    def _zmq_poller_context(self, ):
         zcontext = zmq.Context()  # check creating context in init ( compatibility with multiple processes )
         # Apparently not needed ? Ref : https://github.com/zeromq/pyzmq/issues/770
         zcontext.setsockopt(socket.SO_REUSEADDR, 1)  # required to make restart easy and avoid debugging traps...
         svc_socket = zcontext.socket(zmq.REP)  # Ref : http://api.zeromq.org/2-1:zmq-socket # TODO : ROUTER instead ?
 
         try:  # attempting binding socket
-            svc_socket.bind(self._svc_address,)
+            svc_socket.bind(self._svc_address, )
         except zmq.ZMQError as ze:
             if ze.errno == errno.ENOENT:  # No such file or directory
                 # TODO : handle all possible cases
@@ -414,104 +278,160 @@ class Node(object):
         except Exception as e:
             raise
 
-
         poller = zmq.Poller()
         poller.register(svc_socket, zmq.POLLIN)
 
-        # Initializing all context managers
-        with service_provider_cm(
-                    self.name, self._svc_address, self._providers
-                ), node_cm(self.name, self._svc_address), self.context_manager() as cm:
+        yield {'poller': poller, 'socket': svc_socket}
 
-            # Starting the clock
-            start = time.time()
+        zcontext.term()
 
-            first_loop = True
-            # loop listening to connection
-            while not self.exit.is_set():
+    # Careful : this is NOT the same usage as "run()" from Process :
+    # it is called inside a loop that it does not directly control...
+    # TOOD : think about it and improve (Entity System integration ? Pool + Futures integration ?)
+    def _update(self, poller, svc_socket, **kwargs):
+        """
+        Runs at every update cycle in the node process/thread.
+        ######## Usually you want to override this method to extend the behavior of the node in your implementation #### still true ???
+        :return: integer as exitcode to stop the node, or None to keep looping...
+        """
 
-                # signalling startup only the first time, just after having check for exit request.
-                # We need to guarantee at least ONE call to update.
-                if first_loop:
-                    self.started.set()
+        # blocking. messages are received ASAP. timeout only determine update/shutdown speed.
+        socks = dict(poller.poll(timeout=100))
+        if svc_socket in socks and socks[svc_socket] == zmq.POLLIN:
+            req = None
+            try:
+                req_unparsed = svc_socket.recv()
+                req = ServiceRequest_dictparse(req_unparsed)
+                if isinstance(req, ServiceRequest):
+                    if req.service and req.service in self._providers.keys():
 
-                # blocking. messages are received ASAP. timeout only determine update/shutdown speed.
-                socks = dict(poller.poll(timeout=100))
-                if svc_socket in socks and socks[svc_socket] == zmq.POLLIN:
-                    req = None
-                    try:
-                        req_unparsed = svc_socket.recv()
-                        req = ServiceRequest_dictparse(req_unparsed)
-                        if isinstance(req, ServiceRequest):
-                            if req.service and req.service in self._providers.keys():
+                        request_args = pickle.loads(req.args) if req.args else ()
+                        # add 'self' if providers[req.service] is a bound method.
+                        if self._providers[req.service].self:
+                            request_args = (self,) + request_args
+                        request_kwargs = pickle.loads(req.kwargs) if req.kwargs else {}
 
-                                request_args = pickle.loads(req.args) if req.args else ()
-                                # add 'self' if providers[req.service] is a bound method.
-                                if self._providers[req.service].self:
-                                    request_args = (self, ) + request_args
-                                request_kwargs = pickle.loads(req.kwargs) if req.kwargs else {}
-
-                                resp = self._providers[req.service].func(*request_args, **request_kwargs)
-                                svc_socket.send(ServiceResponse(
-                                    service=req.service,
-                                    response=pickle.dumps(resp),
-                                ).serialize())
-
-                            else:
-                                raise UnknownServiceException("Unknown Service {0}".format(req.service))
-                        else:  # should not happen : dictparse would fail before reaching here...
-                            raise UnknownRequestTypeException("Unknown Request Type {0}".format(type(req.request)))
-                    except Exception:  # we transmit back all errors, and keep spinning...
-                        exctype, excvalue, tb = sys.exc_info()
-                        # trying to make a pickleable traceback
-                        try:
-                            ftb = Traceback(tb)
-                        except TypeError as exc:
-                            ftb = "Traceback manipulation error: {exc}. Verify that python-tblib is installed.".format(exc=exc)
-
-                        # sending back that exception with traceback
+                        resp = self._providers[req.service].func(*request_args, **request_kwargs)
                         svc_socket.send(ServiceResponse(
                             service=req.service,
-                            exception=ServiceException(
-                                exc_type=pickle.dumps(exctype),
-                                exc_value=pickle.dumps(excvalue),
-                                traceback=pickle.dumps(ftb),
-                            )
+                            response=pickle.dumps(resp),
                         ).serialize())
 
-                # time is ticking
-                # TODO : move this out of here. this class should require only generic interface to update method.
-                now = time.time()
-                timedelta = now - start
-                start = now
+                    else:
+                        raise UnknownServiceException("Unknown Service {0}".format(req.service))
+                else:  # should not happen : dictparse would fail before reaching here...
+                    raise UnknownRequestTypeException("Unknown Request Type {0}".format(type(req.request)))
+            except Exception:  # we transmit back all errors, and keep spinning...
+                exctype, excvalue, tb = sys.exc_info()
+                # trying to make a pickleable traceback
+                try:
+                    ftb = Traceback(tb)
+                except TypeError as exc:
+                    ftb = "Traceback manipulation error: {exc}. Verify that python-tblib is installed.".format(exc=exc)
 
-                # replacing the original Process.run() call, passing arguments to our target
-                if self._target:
-                    # bwcompat
-                    kwargs['timedelta'] = timedelta
+                # sending back that exception with traceback
+                svc_socket.send(ServiceResponse(
+                    service=req.service,
+                    exception=ServiceException(
+                        exc_type=pickle.dumps(exctype),
+                        exc_value=pickle.dumps(excvalue),
+                        traceback=pickle.dumps(ftb),
+                    )
+                ).serialize())
 
-                    # TODO : use return code to determine when/how we need to run this the next time...
-                    # Also we need to keep the exit status to be able to call external process as an update...
+        return None  # we keep looping by default (need to deal with services here...)
 
-                    logging.debug("[{self.name}] calling {self._target.__name__} with args {args} and kwargs {kwargs}...".format(**locals()))
-                    exitstatus = self._target(*args, **kwargs)
+    class Control(object):
+        """
+        Node Client is an object to gather stateful services for which the actual node (real world context of service) called matters
+        Note this usually leads to a brittle distributed design, and stateless services should be preferred.
+        """
 
-                if first_loop:
-                    first_loop = False
+        def __init__(self, node_name, svc_address):
+            self.node_name = node_name
 
-                if exitstatus is not None:
-                    break
+            # we assume all nodes have an "index" service.
+            self.index_svc = Service(name='index', providers=[(node_name, svc_address)])
 
-            if self.started.is_set() and exitstatus is None and self.exit.is_set():
-                # in the not so special case where we started, we didnt get exit code and we exited,
-                # this is expected as a normal result and we set an exitcode here of 0
-                # As 0 is the conventional success for unix process successful run
-                exitstatus = 0
+            # we call it
+            svc_list = self.index_svc.call()
+
+            # and dynamically setup proxy calls for services RPC style
+            for s in svc_list:
+                if not hasattr(self, s):  # only if we do not have a similar attribute yet
+                    svc = Service(name=s, providers=[(node_name, svc_address)])
+                    svc_method = svc.call
+                    svc_method.__doc__ = "Remote call for {s}".format(**locals())
+                    svc_method.__name__ = s
+                    setattr(self, svc_method.__name__, svc_method)
+
+                    # TODO : NodeObserver : inverted control flow (to get stream data callback), but in a nice way ?
+                    # something symmetrical to function call....
+
+    @staticmethod
+    def discover(name_regex='.*', timeout=None):
+        """
+        IMPORTANT : This method is not meant to be used by final clients,
+        as it is easy to misuse and tends to produce brittle distributed software.
+        Ideally, the nodes should not matter for the user (client of the zmp multiprocess system).
+        However it is provided here because it can be useful to call stateful remote procedures.
+
+        Discovers all nodes.
+        Note : we do not want to make the discovery block undefinitely since we never know for sure if a node is running or not
+        TODO : improve with future...
+        :param name_regex: regex to filter hte nodes by name/uuid
+        :param timeout: maximum number of seconds the discover can wait for a discovery matching requirements. if None, doesn't wait.
+        """
+        start = time.time()
+        endtime = timeout if timeout else 0
+
+        reg = re.compile(name_regex)
+
+        while True:
+            timed_out = time.time() - start > endtime
+            res = nodes.get_all()
+            if res:
+                return {
+                    res.get('name'): Node.Control(n.get('name'), n.get('address'))
+                    for n in res if reg.match(n.get('name'))
+                # filtering by regex here TODO : move that feature to the Registry
+                }  # return right away if we have something
+
+            if timed_out:
+                break
+            # else we keep looping after a short sleep ( to allow time to refresh services list )
+            time.sleep(0.2)  # sleep
+        return None
+
+    def run(self, *args, **kwargs):
+        """
+        The Node main method, running in a child process (similar to Process.run() but also accepts args)
+        A children class can override this method, but it needs to call super().run(*args, **kwargs)
+        for the node to start properly and call update() as expected.
+        :param args: arguments to pass to update()
+        :param kwargs: keyword arguments to pass to update()
+        :return: last exitcode returned by update()
+        """
+        # TODO : make use of the arguments ? since run is now the target for Process...
+
+        print('[{node}] Node available at [{address}]'.format(node=self.name, address=self._svc_address))
+
+        # Initializing all context managers
+        with self.user_required_context() as cm:  # user context first
+
+            # setting up our event poller
+            with self._zmq_poller_context() as zcm:
+
+                # This will start looping and calling our target...
+                exitstatus = super(Node, self).run(poller=zcm.get('poller'), svc_socket=zcm.get('socket'))
+
+        # all context managers are destroyed properly here
 
         logging.debug("[{self.name}] Node stopped.".format(**locals()))
         return exitstatus  # returning last exit status from the update function
 
-        # all context managers are destroyed properly here
+
+
 
 
 

@@ -6,10 +6,11 @@ import tempfile
 import importlib
 
 import setuptools
+import runpy
 
 # Ref : https://packaging.python.org/single_source_version/#single-sourcing-the-version
-with open('pyzmp/_version.py') as vf:
-    exec(vf.read())
+version = runpy.run_path('pyzmp/_version.py')
+__version__ = version.get('__version__')
 
 # Best Flow :
 # Clean previous build & dist
@@ -43,7 +44,7 @@ class PrepareReleaseCommand(setuptools.Command):
         # $ gitchangelog >CHANGELOG.rst
         # $ git commit CHANGELOG.rst -m "updating changelog"
         # change version in code and changelog
-        subprocess.check_call("git commit CHANGELOG.rst pyros/_version.py -m 'v{0}'".format(__version__), shell=True)
+        subprocess.check_call("git commit CHANGELOG.rst pyzmp/_version.py -m 'v{0}'".format(__version__), shell=True)
         subprocess.check_call("git push", shell=True)
 
         print("You should verify travis checks, and you can publish this release with :")
@@ -181,13 +182,15 @@ setuptools.setup(name='pyzmp',
         'tblib',  # this might not always install six (latest version does not)
         'six',
         'pyzmq',
+        'pyyaml',
+        'psutil',
         'pytest-timeout',
         # Careful : upon install plugins can be resolved instead of core pytest package
         # => pytest should be listed last here...
-        'pytest>=2.9.1',  # since tests are embedded in package
+        'pytest>=2.5.1',  # since tests are embedded in package
     ],
     setup_requires=['pytest-runner'],
-    tests_require=['pytest>=2.9.1'],
+    tests_require=['pytest>=2.5.1'],
     cmdclass={
         'rosdevelop': RosDevelopCommand,
         'prepare_release': PrepareReleaseCommand,

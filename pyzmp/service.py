@@ -28,6 +28,9 @@ from .exceptions import UnknownResponseTypeException
 # Lock is definitely needed ( not implemented in proxy objects, unless the object itself already has it, like Queue )
 services_lock = manager.Lock()
 services = manager.dict()
+# TODO : drop this and retrieve directly from Nodes.
+# TODO : later we can create a "cache" of services, but this will create more problems,
+# so it should just be an option, not a basis feature....
 
 
 @contextlib.contextmanager
@@ -91,7 +94,7 @@ class Service(object):
     def __init__(self, name, providers=None):
         self.name = name
         self.providers = providers
-        # TODO : make a provide just a list of node names, and have connection URLs somewhere else...
+        # TODO : make a provide just a list of node names/ids, and retrieve connection URLs from registry...
 
     # TODO : implement async_call ( and return future )
     def call(self, args=None, kwargs=None, node=None, send_timeout=1000, recv_timeout=5000, zmq_ctx=None):
@@ -153,3 +156,10 @@ class Service(object):
 
 # convenience
 discover = Service.discover
+
+
+# TODO :
+# class SteamListener:
+#     """the class with inverted control flow compared to NodeClient : everything is callback"""
+#     def listen_on(self, svc_name):
+#     """Setup a callback when some data arrived, stream like... using observables / futures ? """

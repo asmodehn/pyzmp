@@ -5,6 +5,9 @@
 tox>=2.3.1
 twine==1.11.0
 
+# for test and development
+pytest-pycharm>=0.4.0
+
 #Used by setup.py rosdevelop
 gitpython>=2.1.0
 pyyaml>=3.12
